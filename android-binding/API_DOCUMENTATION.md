@@ -272,3 +272,31 @@ suspend fun uploadResizedImage(rawImageBytes: ByteArray) {
     }
 }
 ```
+
+---
+
+## 3. Detail Optimasi & Arsitektur JNI (Terbaru)
+
+Binding ini dikonfigurasi untuk memenuhi tuntutan kinerja ekstrim dan efisiensi memori tinggi di Android dengan optimasi berikut:
+
+### A. Dynamic Loading Efisien
+Memuat library native secara otomatis menggunakan satu panggilan `System.loadLibrary("vips_jni")`. Sistem dynamic linker Android 6.0+ (API 23+) akan otomatis memetakan relasi dependensi rekursif (seperti `libvips.so`, GLib, dsb.) secara efisien dari metadata ELF header.
+
+### B. Adaptive Concurrency (Penjadwalan Thread Pintar)
+Concurrency threads disesuaikan secara dinamis untuk CPU mobile berbasis arsitektur heterogeneous *big.LITTLE*:
+- Jika core `>= 8`, threads diset ke `cores / 2` (biasanya hanya menggunakan core berkinerja tinggi).
+- Jika core `4 - 7`, threads diset ke `cores - 1` (menyisakan core untuk kelancaran UI thread).
+- Menghindari thermal throttling dan menjaga frame rate aplikasi tetap tinggi.
+
+### C. Pemrosesan Bitmap Zero-Leak (RAII & Zero-Copy)
+- **Zero-Copy input**: Menggunakan memory address bitmap asal (`AndroidBitmap_lockPixels`) secara langsung tanpa membuat buffer temporer.
+- **Garbage-Free C++ RAII**: Seluruh referensi gambar native (`VipsImagePtr`), penguncian bitmap (`BitmapPixelLock`), JNI strings, dan byte arrays dibungkus dengan C++ RAII. Memory dilepas secara otomatis saat keluar dari scope eksekusi fungsi native, menjamin nol kebocoran memori.
+- **Normalisasi RGBA**: [resizeBitmap](file:///data/data/com.termux/files/home/libvips/android-binding/src/main/kotlin/io/github/anaruto/vips/Vips.kt#L135-L145) secara otomatis melakukan konversi interpretations sRGB, alpha premultiplication (mencegah halo gelap di area transparan), dan konversi format output ke `UCHAR` 4-channels (RGBA) yang kompatibel penuh dengan `ARGB_8888`.
+
+### D. Optimasi Kompiler Tingkat Tinggi (CMake)
+Kompilasi native menggunakan flags `-O3` dan `-ffast-math` untuk optimasi instruksi ARM NEON, `-fno-exceptions` dan `-fno-rtti` untuk mereduksi ukuran file binary `.so`, serta mengaktifkan *Link-Time Optimization (LTO)* untuk analisis kode lintas modul.
+
+### E. Kotlin GC & Lock-Free Optimization
+- Validasi format input menggunakan cache statis Set `SUPPORTED_FORMATS` untuk mereduksi sampah objek temporer di Java Virtual Machine.
+- Pengecekan inisialisasi thread-safe dan lock-free menggunakan status thread visibility volatile `AtomicBoolean` pada Kotlin wrapper.
+
