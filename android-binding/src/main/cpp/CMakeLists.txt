@@ -45,3 +45,25 @@ target_link_libraries(vips_jni
     gobject-2.0
     gio-2.0
 )
+
+# Compiler optimization options
+target_compile_options(vips_jni PRIVATE
+    -O3
+    -ffast-math
+    -fno-exceptions
+    -fno-rtti
+)
+
+# Hide non-JNI symbols to minimize binary size and dynamic loading overhead
+set_target_properties(vips_jni PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+
+# Enable Interprocedural Optimization / Link-Time Optimization (LTO) if supported
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+if(ipo_supported)
+    set_target_properties(vips_jni PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+

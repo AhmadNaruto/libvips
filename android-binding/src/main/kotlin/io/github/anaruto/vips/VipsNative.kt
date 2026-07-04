@@ -1,6 +1,7 @@
 package io.github.anaruto.vips
 
 import android.graphics.Bitmap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Raw JNI bindings for libvips.
@@ -8,26 +9,13 @@ import android.graphics.Bitmap
  * and maps the external JNI functions directly.
  */
 object VipsNative {
-    private var initialized = false
+    private val initialized = AtomicBoolean(false)
 
     init {
         try {
-            // Load native prebuilt dependencies in order of reference
-            System.loadLibrary("z")
-            System.loadLibrary("intl")
-            System.loadLibrary("glib-2.0")
-            System.loadLibrary("gmodule-2.0")
-            System.loadLibrary("gobject-2.0")
-            System.loadLibrary("gthread-2.0")
-            System.loadLibrary("gio-2.0")
-            try {
-                System.loadLibrary("girepository-2.0")
-            } catch (e: UnsatisfiedLinkError) {
-                // Keep going, might be built without GI bindings
-            }
-            System.loadLibrary("vips")
-            
-            // Load the custom JNI bridge library
+            // Load the custom JNI bridge library.
+            // On Android 6.0+ (API 23+), the dynamic linker automatically loads transitively
+            // linked library dependencies (libvips, glib, etc.) in topological order.
             System.loadLibrary("vips_jni")
         } catch (e: UnsatisfiedLinkError) {
             System.err.println("VipsNative: Error loading native libvips shared libraries: ${e.message}")
@@ -114,14 +102,19 @@ object VipsNative {
     external fun resizeBitmap(srcBitmap: Bitmap, dstBitmap: Bitmap): Boolean
 
     /**
-     * Thread-safe synchronized initialization helper.
+     * Thread-safe initialization helper.
      */
-    @Synchronized
     fun safeInit(): Boolean {
-        if (initialized) return true
-        initialized = init()
-        return initialized
+        if (initialized.get()) return true
+        synchronized(initialized) {
+            if (!initialized.get()) {
+                if (init()) {
+                    initialized.set(true)
+                }
+            }
+        }
+        return initialized.get()
     }
 
-    fun isInitialized() = initialized
+    fun isInitialized(): Boolean = initialized.get()
 }

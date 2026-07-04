@@ -9,6 +9,7 @@ import android.graphics.Bitmap
  * This class wraps raw JNI calls with input validations to prevent native segmentation faults.
  */
 object Vips {
+    private val SUPPORTED_FORMATS = setOf("jpeg", "jpg", "png", "webp")
 
     /**
      * Initializes the libvips runtime environment.
@@ -99,7 +100,7 @@ object Vips {
         require(input.isNotEmpty()) { "Input image data cannot be empty" }
         require(format.isNotBlank()) { "Target format cannot be blank" }
         val normalized = format.trim().lowercase()
-        require(normalized in setOf("jpeg", "jpg", "png", "webp")) {
+        require(normalized in SUPPORTED_FORMATS) {
             "Unsupported format: $format. Supported: jpeg, png, webp"
         }
         return VipsNative.convertFormat(input, normalized)
@@ -117,7 +118,7 @@ object Vips {
         require(input.isNotEmpty()) { "Input image data cannot be empty" }
         require(scale > 0.0) { "Scale factor must be positive" }
         val normalized = outputFormat.trim().lowercase()
-        require(normalized in setOf("jpeg", "jpg", "png", "webp")) {
+        require(normalized in SUPPORTED_FORMATS) {
             "Unsupported output format: $outputFormat. Supported: jpeg, png, webp"
         }
         return VipsNative.resize(input, scale, normalized)

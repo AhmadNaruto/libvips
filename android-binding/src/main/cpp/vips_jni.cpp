@@ -6,11 +6,158 @@
 #include <cstring>
 #include <thread>
 
+// Conditional logging: Info and Error logging is disabled in Release builds.
+// In Android, NDEBUG is defined for release builds.
+#ifdef NDEBUG
+#define LOGI(...) ((void)0)
+#define LOGE(...) ((void)0)
+#else
 #define LOG_TAG "VIPS_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#endif
+
+// JNI Exception Checks Helpers
+#define CHECK_EXCEPTION(env) \
+    if (env->ExceptionCheck()) { \
+        return nullptr; \
+    }
+
+#define CHECK_EXCEPTION_BOOL(env) \
+    if (env->ExceptionCheck()) { \
+        return JNI_FALSE; \
+    }
+
+#define CHECK_EXCEPTION_VOID(env) \
+    if (env->ExceptionCheck()) { \
+        return; \
+    }
 
 extern "C" {
+
+// ============================================================================
+// RAII Classes for safe and automated resource lifecycle management
+// ============================================================================
+
+// RAII Wrapper for VipsImage* to ensure proper g_object_unref
+class VipsImagePtr {
+public:
+    explicit VipsImagePtr(VipsImage *ptr = nullptr) : ptr_(ptr) {}
+    ~VipsImagePtr() {
+        if (ptr_) {
+            g_object_unref(ptr_);
+        }
+    }
+    VipsImage* get() const { return ptr_; }
+    VipsImage* release() {
+        VipsImage* temp = ptr_;
+        ptr_ = nullptr;
+        return temp;
+    }
+    void reset(VipsImage* ptr) {
+        if (ptr_) {
+            g_object_unref(ptr_);
+        }
+        ptr_ = ptr;
+    }
+    operator VipsImage*() const { return ptr_; }
+    VipsImage* operator->() const { return ptr_; }
+    bool operator!() const { return !ptr_; }
+private:
+    VipsImage *ptr_;
+    VipsImagePtr(const VipsImagePtr&) = delete;
+    VipsImagePtr& operator=(const VipsImagePtr&) = delete;
+};
+
+// RAII Lock/Unlock for Android Bitmap pixels
+class BitmapPixelLock {
+public:
+    BitmapPixelLock(JNIEnv *env, jobject bitmap) : env_(env), bitmap_(bitmap), pixels_(nullptr), locked_(false) {
+        if (bitmap_) {
+            if (AndroidBitmap_lockPixels(env_, bitmap_, &pixels_) >= 0) {
+                locked_ = true;
+            }
+        }
+    }
+    ~BitmapPixelLock() {
+        if (locked_) {
+            AndroidBitmap_unlockPixels(env_, bitmap_);
+        }
+    }
+    void* pixels() const { return pixels_; }
+    bool isLocked() const { return locked_; }
+private:
+    JNIEnv *env_;
+    jobject bitmap_;
+    void *pixels_;
+    bool locked_;
+    BitmapPixelLock(const BitmapPixelLock&) = delete;
+    BitmapPixelLock& operator=(const BitmapPixelLock&) = delete;
+};
+
+// RAII String characters fetch & release
+class JniStringChars {
+public:
+    JniStringChars(JNIEnv *env, jstring str) : env_(env), str_(str), chars_(nullptr) {
+        if (str_) {
+            chars_ = env_->GetStringUTFChars(str_, nullptr);
+        }
+    }
+    ~JniStringChars() {
+        if (chars_) {
+            env_->ReleaseStringUTFChars(str_, chars_);
+        }
+    }
+    const char* get() const { return chars_; }
+    operator const char*() const { return chars_; }
+    bool operator!() const { return !chars_; }
+private:
+    JNIEnv *env_;
+    jstring str_;
+    const char *chars_;
+    JniStringChars(const JniStringChars&) = delete;
+    JniStringChars& operator=(const JniStringChars&) = delete;
+};
+
+// RAII Byte array elements fetch & release with JNI_ABORT mode (read-only)
+class JniByteArrayElements {
+public:
+    JniByteArrayElements(JNIEnv *env, jbyteArray array, jint mode = JNI_ABORT) 
+        : env_(env), array_(array), elements_(nullptr), mode_(mode) {
+        if (array_) {
+            elements_ = env_->GetByteArrayElements(array_, nullptr);
+        }
+    }
+    ~JniByteArrayElements() {
+        if (elements_) {
+            env_->ReleaseByteArrayElements(array_, elements_, mode_);
+        }
+    }
+    jbyte* get() const { return elements_; }
+    operator jbyte*() const { return elements_; }
+    bool operator!() const { return !elements_; }
+private:
+    JNIEnv *env_;
+    jbyteArray array_;
+    jbyte *elements_;
+    jint mode_;
+    JniByteArrayElements(const JniByteArrayElements&) = delete;
+    JniByteArrayElements& operator=(const JniByteArrayElements&) = delete;
+};
+
+// ============================================================================
+// Concurrency Heuristic
+// ============================================================================
+
+// Returns optimal threads to spawn based on logical processor count.
+// Caps threads to protect performance cores, prevent thermal throttling,
+// and avoid UI main thread starvation on big.LITTLE architectures.
+inline unsigned int get_optimal_concurrency(unsigned int cores) {
+    if (cores <= 1) return 1;
+    if (cores <= 3) return 2;
+    if (cores <= 7) return cores - 1; // e.g. 4 cores -> 3 threads, leaving 1 for UI
+    return cores / 2; // e.g. 8 cores -> 4 threads, utilizing big cores only
+}
 
 // ============================================================================
 // Core Library Lifecycle & Optimizations
@@ -26,12 +173,13 @@ Java_io_github_anaruto_vips_VipsNative_init(JNIEnv *env, jclass clazz) {
     
     // Set optimized defaults for resource-constrained Android devices:
     unsigned int cores = std::thread::hardware_concurrency();
-    vips_concurrency_set(cores > 0 ? cores : 2);
+    unsigned int optimal_threads = get_optimal_concurrency(cores);
+    vips_concurrency_set(optimal_threads);
     vips_cache_set_max_mem(50 * 1024 * 1024); // Limit cache memory to 50MB by default to prevent OOM
     vips_cache_set_max(50);                   // Limit cache size to 50 operations
     vips_cache_set_max_files(10);             // Limit max open files to 10
     
-    LOGI("libvips initialized successfully (concurrency: %d, cache: 50MB). Version: %s", 
+    LOGI("libvips initialized successfully (concurrency: %d threads, cache: 50MB). Version: %s", 
          vips_concurrency_get(), vips_version_string());
     return JNI_TRUE;
 }
@@ -44,7 +192,9 @@ Java_io_github_anaruto_vips_VipsNative_shutdown(JNIEnv *env, jclass clazz) {
 
 JNIEXPORT jstring JNICALL
 Java_io_github_anaruto_vips_VipsNative_getVersion(JNIEnv *env, jclass clazz) {
-    return env->NewStringUTF(vips_version_string());
+    jstring result = env->NewStringUTF(vips_version_string());
+    CHECK_EXCEPTION(env);
+    return result;
 }
 
 JNIEXPORT void JNICALL
@@ -78,13 +228,13 @@ Java_io_github_anaruto_vips_VipsNative_setCacheMaxFiles(JNIEnv *env, jclass claz
 JNIEXPORT jstring JNICALL
 Java_io_github_anaruto_vips_VipsNative_getImageInfo(JNIEnv *env, jclass clazz, jstring path) {
     if (!path) return nullptr;
-    const char *cpath = env->GetStringUTFChars(path, nullptr);
+    JniStringChars cpath(env, path);
+    if (!cpath.get()) return nullptr;
     
-    VipsImage *image = vips_image_new_from_file(cpath, nullptr);
+    VipsImagePtr image(vips_image_new_from_file(cpath, nullptr));
     if (!image) {
-        LOGE("Failed to load image: %s. Error: %s", cpath, vips_error_buffer());
+        LOGE("Failed to load image: %s. Error: %s", cpath.get(), vips_error_buffer());
         vips_error_clear();
-        env->ReleaseStringUTFChars(path, cpath);
         return env->NewStringUTF("{\"error\": \"Failed to load image from file\"}");
     }
     
@@ -95,6 +245,11 @@ Java_io_github_anaruto_vips_VipsNative_getImageInfo(JNIEnv *env, jclass clazz, j
     VipsInterpretation interpretation = vips_image_get_interpretation(image);
     
     size_t size_estimate = (size_t)width * height * bands * vips_format_sizeof(format);
+    
+    const char *format_nick = vips_enum_nick(VIPS_TYPE_BAND_FORMAT, format);
+    if (!format_nick) format_nick = "unknown";
+    const char *interpretation_nick = vips_enum_nick(VIPS_TYPE_INTERPRETATION, interpretation);
+    if (!interpretation_nick) interpretation_nick = "unknown";
     
     char info[2048];
     snprintf(info, sizeof(info),
@@ -109,30 +264,30 @@ Java_io_github_anaruto_vips_VipsNative_getImageInfo(JNIEnv *env, jclass clazz, j
         "  \"yres\": %.2f,\n"
         "  \"estimated_size_bytes\": %zu\n"
         "}",
-        cpath, width, height, bands,
-        vips_enum_nick(VIPS_TYPE_BAND_FORMAT, format),
-        vips_enum_nick(VIPS_TYPE_INTERPRETATION, interpretation),
+        cpath.get(), width, height, bands,
+        format_nick,
+        interpretation_nick,
         vips_image_get_xres(image),
         vips_image_get_yres(image),
         size_estimate
     );
     
-    g_object_unref(image);
-    env->ReleaseStringUTFChars(path, cpath);
-    return env->NewStringUTF(info);
+    jstring result = env->NewStringUTF(info);
+    CHECK_EXCEPTION(env);
+    return result;
 }
 
 JNIEXPORT jstring JNICALL
 Java_io_github_anaruto_vips_VipsNative_getImageInfoFromBuffer(JNIEnv *env, jclass clazz, jbyteArray buffer) {
     if (!buffer) return nullptr;
     jsize len = env->GetArrayLength(buffer);
-    jbyte *data = env->GetByteArrayElements(buffer, nullptr);
+    JniByteArrayElements data(env, buffer);
+    if (!data.get()) return nullptr;
     
-    VipsImage *image = vips_image_new_from_buffer(data, len, "", nullptr);
+    VipsImagePtr image(vips_image_new_from_buffer(data, len, "", nullptr));
     if (!image) {
         LOGE("Failed to load image from buffer: %s", vips_error_buffer());
         vips_error_clear();
-        env->ReleaseByteArrayElements(buffer, data, JNI_ABORT);
         return env->NewStringUTF("{\"error\": \"Failed to load image from buffer\"}");
     }
     
@@ -143,6 +298,11 @@ Java_io_github_anaruto_vips_VipsNative_getImageInfoFromBuffer(JNIEnv *env, jclas
     VipsInterpretation interpretation = vips_image_get_interpretation(image);
     
     size_t size_estimate = (size_t)width * height * bands * vips_format_sizeof(format);
+    
+    const char *format_nick = vips_enum_nick(VIPS_TYPE_BAND_FORMAT, format);
+    if (!format_nick) format_nick = "unknown";
+    const char *interpretation_nick = vips_enum_nick(VIPS_TYPE_INTERPRETATION, interpretation);
+    if (!interpretation_nick) interpretation_nick = "unknown";
     
     char info[2048];
     snprintf(info, sizeof(info),
@@ -157,14 +317,14 @@ Java_io_github_anaruto_vips_VipsNative_getImageInfoFromBuffer(JNIEnv *env, jclas
         "  \"estimated_size_bytes\": %zu\n"
         "}",
         len, width, height, bands,
-        vips_enum_nick(VIPS_TYPE_BAND_FORMAT, format),
-        vips_enum_nick(VIPS_TYPE_INTERPRETATION, interpretation),
+        format_nick,
+        interpretation_nick,
         size_estimate
     );
     
-    g_object_unref(image);
-    env->ReleaseByteArrayElements(buffer, data, JNI_ABORT);
-    return env->NewStringUTF(info);
+    jstring result = env->NewStringUTF(info);
+    CHECK_EXCEPTION(env);
+    return result;
 }
 
 // ============================================================================
@@ -175,13 +335,13 @@ JNIEXPORT jbyteArray JNICALL
 Java_io_github_anaruto_vips_VipsNative_compressJpeg(JNIEnv *env, jclass clazz, jbyteArray input, jint quality) {
     if (!input) return nullptr;
     jsize len = env->GetArrayLength(input);
-    jbyte *data = env->GetByteArrayElements(input, nullptr);
+    JniByteArrayElements data(env, input);
+    if (!data.get()) return nullptr;
     
-    VipsImage *image = vips_image_new_from_buffer(data, len, "", nullptr);
+    VipsImagePtr image(vips_image_new_from_buffer(data, len, "", nullptr));
     if (!image) {
         LOGE("Failed to parse source buffer for JPEG compression: %s", vips_error_buffer());
         vips_error_clear();
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
         return nullptr;
     }
     
@@ -190,17 +350,16 @@ Java_io_github_anaruto_vips_VipsNative_compressJpeg(JNIEnv *env, jclass clazz, j
     if (vips_jpegsave_buffer(image, &outBuf, &outLen, "Q", quality, nullptr) != 0) {
         LOGE("Failed to encode JPEG: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(image);
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
         return nullptr;
     }
     
     jbyteArray result = env->NewByteArray(outLen);
-    env->SetByteArrayRegion(result, 0, outLen, (jbyte*)outBuf);
+    if (result) {
+        env->SetByteArrayRegion(result, 0, outLen, (jbyte*)outBuf);
+    }
     
     g_free(outBuf);
-    g_object_unref(image);
-    env->ReleaseByteArrayElements(input, data, JNI_ABORT);
+    CHECK_EXCEPTION(env);
     return result;
 }
 
@@ -208,13 +367,13 @@ JNIEXPORT jbyteArray JNICALL
 Java_io_github_anaruto_vips_VipsNative_compressWebp(JNIEnv *env, jclass clazz, jbyteArray input, jint quality) {
     if (!input) return nullptr;
     jsize len = env->GetArrayLength(input);
-    jbyte *data = env->GetByteArrayElements(input, nullptr);
+    JniByteArrayElements data(env, input);
+    if (!data.get()) return nullptr;
     
-    VipsImage *image = vips_image_new_from_buffer(data, len, "", nullptr);
+    VipsImagePtr image(vips_image_new_from_buffer(data, len, "", nullptr));
     if (!image) {
         LOGE("Failed to parse source buffer for WebP compression: %s", vips_error_buffer());
         vips_error_clear();
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
         return nullptr;
     }
     
@@ -223,17 +382,16 @@ Java_io_github_anaruto_vips_VipsNative_compressWebp(JNIEnv *env, jclass clazz, j
     if (vips_webpsave_buffer(image, &outBuf, &outLen, "Q", quality, nullptr) != 0) {
         LOGE("Failed to encode WebP: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(image);
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
         return nullptr;
     }
     
     jbyteArray result = env->NewByteArray(outLen);
-    env->SetByteArrayRegion(result, 0, outLen, (jbyte*)outBuf);
+    if (result) {
+        env->SetByteArrayRegion(result, 0, outLen, (jbyte*)outBuf);
+    }
     
     g_free(outBuf);
-    g_object_unref(image);
-    env->ReleaseByteArrayElements(input, data, JNI_ABORT);
+    CHECK_EXCEPTION(env);
     return result;
 }
 
@@ -241,13 +399,13 @@ JNIEXPORT jbyteArray JNICALL
 Java_io_github_anaruto_vips_VipsNative_compressPng(JNIEnv *env, jclass clazz, jbyteArray input, jint compression) {
     if (!input) return nullptr;
     jsize len = env->GetArrayLength(input);
-    jbyte *data = env->GetByteArrayElements(input, nullptr);
+    JniByteArrayElements data(env, input);
+    if (!data.get()) return nullptr;
     
-    VipsImage *image = vips_image_new_from_buffer(data, len, "", nullptr);
+    VipsImagePtr image(vips_image_new_from_buffer(data, len, "", nullptr));
     if (!image) {
         LOGE("Failed to parse source buffer for PNG compression: %s", vips_error_buffer());
         vips_error_clear();
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
         return nullptr;
     }
     
@@ -256,127 +414,119 @@ Java_io_github_anaruto_vips_VipsNative_compressPng(JNIEnv *env, jclass clazz, jb
     if (vips_pngsave_buffer(image, &outBuf, &outLen, "compression", compression, nullptr) != 0) {
         LOGE("Failed to encode PNG: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(image);
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
         return nullptr;
     }
     
     jbyteArray result = env->NewByteArray(outLen);
-    env->SetByteArrayRegion(result, 0, outLen, (jbyte*)outBuf);
+    if (result) {
+        env->SetByteArrayRegion(result, 0, outLen, (jbyte*)outBuf);
+    }
     
     g_free(outBuf);
-    g_object_unref(image);
-    env->ReleaseByteArrayElements(input, data, JNI_ABORT);
+    CHECK_EXCEPTION(env);
     return result;
 }
 
 JNIEXPORT jbyteArray JNICALL
 Java_io_github_anaruto_vips_VipsNative_convertFormat(JNIEnv *env, jclass clazz, jbyteArray input, jstring format) {
     if (!input || !format) return nullptr;
-    const char *formatStr = env->GetStringUTFChars(format, nullptr);
-    jsize len = env->GetArrayLength(input);
-    jbyte *data = env->GetByteArrayElements(input, nullptr);
+    JniStringChars formatStr(env, format);
+    if (!formatStr.get()) return nullptr;
     
-    VipsImage *image = vips_image_new_from_buffer(data, len, "", nullptr);
+    jsize len = env->GetArrayLength(input);
+    JniByteArrayElements data(env, input);
+    if (!data.get()) return nullptr;
+    
+    VipsImagePtr image(vips_image_new_from_buffer(data, len, "", nullptr));
     if (!image) {
         LOGE("Failed to parse source buffer: %s", vips_error_buffer());
         vips_error_clear();
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
-        env->ReleaseStringUTFChars(format, formatStr);
         return nullptr;
     }
     
     void *outBuf = nullptr;
     size_t outLen = 0;
-    int result = -1;
+    int result_code = -1;
     
     if (strcasecmp(formatStr, "jpeg") == 0 || strcasecmp(formatStr, "jpg") == 0) {
-        result = vips_jpegsave_buffer(image, &outBuf, &outLen, nullptr);
+        result_code = vips_jpegsave_buffer(image, &outBuf, &outLen, nullptr);
     } else if (strcasecmp(formatStr, "png") == 0) {
-        result = vips_pngsave_buffer(image, &outBuf, &outLen, nullptr);
+        result_code = vips_pngsave_buffer(image, &outBuf, &outLen, nullptr);
     } else if (strcasecmp(formatStr, "webp") == 0) {
-        result = vips_webpsave_buffer(image, &outBuf, &outLen, nullptr);
+        result_code = vips_webpsave_buffer(image, &outBuf, &outLen, nullptr);
     } else {
-        LOGE("Unsupported format for convert: %s", formatStr);
+        LOGE("Unsupported format for convert: %s", formatStr.get());
     }
     
-    if (result != 0) {
-        LOGE("Failed to convert image to %s. Error: %s", formatStr, vips_error_buffer());
+    if (result_code != 0) {
+        LOGE("Failed to convert image to %s. Error: %s", formatStr.get(), vips_error_buffer());
         vips_error_clear();
-        g_object_unref(image);
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
-        env->ReleaseStringUTFChars(format, formatStr);
         return nullptr;
     }
     
     jbyteArray output = env->NewByteArray(outLen);
-    env->SetByteArrayRegion(output, 0, outLen, (jbyte*)outBuf);
+    if (output) {
+        env->SetByteArrayRegion(output, 0, outLen, (jbyte*)outBuf);
+    }
     
     g_free(outBuf);
-    g_object_unref(image);
-    env->ReleaseByteArrayElements(input, data, JNI_ABORT);
-    env->ReleaseStringUTFChars(format, formatStr);
+    CHECK_EXCEPTION(env);
     return output;
 }
 
 JNIEXPORT jbyteArray JNICALL
 Java_io_github_anaruto_vips_VipsNative_resize(JNIEnv *env, jclass clazz, jbyteArray input, jdouble scale, jstring outputFormat) {
     if (!input || !outputFormat) return nullptr;
-    const char *formatStr = env->GetStringUTFChars(outputFormat, nullptr);
-    jsize len = env->GetArrayLength(input);
-    jbyte *data = env->GetByteArrayElements(input, nullptr);
+    JniStringChars formatStr(env, outputFormat);
+    if (!formatStr.get()) return nullptr;
     
-    VipsImage *image = vips_image_new_from_buffer(data, len, "", nullptr);
+    jsize len = env->GetArrayLength(input);
+    JniByteArrayElements data(env, input);
+    if (!data.get()) return nullptr;
+    
+    VipsImagePtr image(vips_image_new_from_buffer(data, len, "", nullptr));
     if (!image) {
         LOGE("Failed to parse image for resizing: %s", vips_error_buffer());
         vips_error_clear();
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
-        env->ReleaseStringUTFChars(outputFormat, formatStr);
         return nullptr;
     }
     
-    VipsImage *resized = nullptr;
-    if (vips_resize(image, &resized, scale, nullptr) != 0) {
+    VipsImagePtr resized;
+    VipsImage *resized_raw = nullptr;
+    if (vips_resize(image, &resized_raw, scale, nullptr) != 0) {
         LOGE("Failed to resize image. Error: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(image);
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
-        env->ReleaseStringUTFChars(outputFormat, formatStr);
         return nullptr;
     }
+    resized.reset(resized_raw);
     
     void *outBuf = nullptr;
     size_t outLen = 0;
-    int result = -1;
+    int result_code = -1;
     
     if (strcasecmp(formatStr, "jpeg") == 0 || strcasecmp(formatStr, "jpg") == 0) {
-        result = vips_jpegsave_buffer(resized, &outBuf, &outLen, nullptr);
+        result_code = vips_jpegsave_buffer(resized, &outBuf, &outLen, nullptr);
     } else if (strcasecmp(formatStr, "png") == 0) {
-        result = vips_pngsave_buffer(resized, &outBuf, &outLen, nullptr);
+        result_code = vips_pngsave_buffer(resized, &outBuf, &outLen, nullptr);
     } else if (strcasecmp(formatStr, "webp") == 0) {
-        result = vips_webpsave_buffer(resized, &outBuf, &outLen, nullptr);
+        result_code = vips_webpsave_buffer(resized, &outBuf, &outLen, nullptr);
     } else {
-        LOGE("Unsupported format for resized image output: %s", formatStr);
+        LOGE("Unsupported format for resized image output: %s", formatStr.get());
     }
     
-    if (result != 0) {
-        LOGE("Failed to save resized image. Error: %s", vips_error_buffer());
+    if (result_code != 0) {
+        LOGE("Failed to save resized image. Error: %s", formatStr.get(), vips_error_buffer());
         vips_error_clear();
-        g_object_unref(resized);
-        g_object_unref(image);
-        env->ReleaseByteArrayElements(input, data, JNI_ABORT);
-        env->ReleaseStringUTFChars(outputFormat, formatStr);
         return nullptr;
     }
     
     jbyteArray output = env->NewByteArray(outLen);
-    env->SetByteArrayRegion(output, 0, outLen, (jbyte*)outBuf);
+    if (output) {
+        env->SetByteArrayRegion(output, 0, outLen, (jbyte*)outBuf);
+    }
     
     g_free(outBuf);
-    g_object_unref(resized);
-    g_object_unref(image);
-    env->ReleaseByteArrayElements(input, data, JNI_ABORT);
-    env->ReleaseStringUTFChars(outputFormat, formatStr);
+    CHECK_EXCEPTION(env);
     return output;
 }
 
@@ -389,41 +539,49 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
     if (!srcBitmap || !dstBitmap) return JNI_FALSE;
 
     AndroidBitmapInfo srcInfo;
-    void* srcPixels = nullptr;
-    if (AndroidBitmap_getInfo(env, srcBitmap, &srcInfo) < 0 || AndroidBitmap_lockPixels(env, srcBitmap, &srcPixels) < 0) {
-        LOGE("Failed to lock source Bitmap pixels");
+    if (AndroidBitmap_getInfo(env, srcBitmap, &srcInfo) < 0) {
+        LOGE("Failed to get source Bitmap info");
         return JNI_FALSE;
     }
 
     AndroidBitmapInfo dstInfo;
-    void* dstPixels = nullptr;
-    if (AndroidBitmap_getInfo(env, dstBitmap, &dstInfo) < 0 || AndroidBitmap_lockPixels(env, dstBitmap, &dstPixels) < 0) {
-        LOGE("Failed to lock destination Bitmap pixels");
-        AndroidBitmap_unlockPixels(env, srcBitmap);
+    if (AndroidBitmap_getInfo(env, dstBitmap, &dstInfo) < 0) {
+        LOGE("Failed to get destination Bitmap info");
         return JNI_FALSE;
     }
 
     if (srcInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || dstInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
         LOGE("Error: Only ARGB_8888 format is supported for Bitmaps");
-        AndroidBitmap_unlockPixels(env, srcBitmap);
-        AndroidBitmap_unlockPixels(env, dstBitmap);
         return JNI_FALSE;
     }
 
+    BitmapPixelLock srcLock(env, srcBitmap);
+    if (!srcLock.isLocked()) {
+        LOGE("Failed to lock source Bitmap pixels");
+        return JNI_FALSE;
+    }
+
+    BitmapPixelLock dstLock(env, dstBitmap);
+    if (!dstLock.isLocked()) {
+        LOGE("Failed to lock destination Bitmap pixels");
+        return JNI_FALSE;
+    }
+
+    void* srcPixels = srcLock.pixels();
+    void* dstPixels = dstLock.pixels();
+
     // Create a VipsImage wrapper around the source Bitmap's raw memory address (zero-copy creation)
-    VipsImage *image = vips_image_new_from_memory(
+    VipsImagePtr image(vips_image_new_from_memory(
         srcPixels,
         (size_t)srcInfo.width * srcInfo.height * 4,
         srcInfo.width,
         srcInfo.height,
         4,
         VIPS_BAND_FORMAT_UCHAR
-    );
+    ));
     if (!image) {
         LOGE("Failed to construct VipsImage wrapper from Bitmap pixels: %s", vips_error_buffer());
         vips_error_clear();
-        AndroidBitmap_unlockPixels(env, srcBitmap);
-        AndroidBitmap_unlockPixels(env, dstBitmap);
         return JNI_FALSE;
     }
 
@@ -437,61 +595,107 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
 
     // PREMULTIPLY ALPHA: Multiply color channels by alpha channel prior to resizing.
     // This resolves dark borders/halos on transparent areas during interpolation.
-    VipsImage *premultiplied = nullptr;
-    if (vips_premultiply(image, &premultiplied, nullptr) != 0) {
+    VipsImagePtr premultiplied;
+    VipsImage *premultiplied_raw = nullptr;
+    if (vips_premultiply(image, &premultiplied_raw, nullptr) != 0) {
         LOGE("Vips: Failed to premultiply alpha: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(image);
-        AndroidBitmap_unlockPixels(env, srcBitmap);
-        AndroidBitmap_unlockPixels(env, dstBitmap);
         return JNI_FALSE;
     }
+    premultiplied.reset(premultiplied_raw);
 
     // Resize using Lanczos-3 (default vips_resize kernel).
     // Specifying "vscale" allows asymmetric resizing (stretching) if target aspect ratio is different.
-    VipsImage *resized = nullptr;
-    if (vips_resize(premultiplied, &resized, scale_x, "vscale", vscale, nullptr) != 0) {
+    VipsImagePtr resized;
+    VipsImage *resized_raw = nullptr;
+    if (vips_resize(premultiplied, &resized_raw, scale_x, "vscale", vscale, nullptr) != 0) {
         LOGE("Vips: Failed to execute resize operation: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(premultiplied);
-        g_object_unref(image);
-        AndroidBitmap_unlockPixels(env, srcBitmap);
-        AndroidBitmap_unlockPixels(env, dstBitmap);
         return JNI_FALSE;
     }
+    resized.reset(resized_raw);
 
     // UNPREMULTIPLY ALPHA: Divide color channels by alpha channel back to standard RGBA.
-    VipsImage *unpremultiplied = nullptr;
-    if (vips_unpremultiply(resized, &unpremultiplied, nullptr) != 0) {
+    VipsImagePtr unpremultiplied;
+    VipsImage *unpremultiplied_raw = nullptr;
+    if (vips_unpremultiply(resized, &unpremultiplied_raw, nullptr) != 0) {
         LOGE("Vips: Failed to unpremultiply alpha: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(resized);
-        g_object_unref(premultiplied);
-        g_object_unref(image);
-        AndroidBitmap_unlockPixels(env, srcBitmap);
-        AndroidBitmap_unlockPixels(env, dstBitmap);
         return JNI_FALSE;
     }
+    unpremultiplied.reset(unpremultiplied_raw);
 
     // Ensure output has exactly 4 channels (RGBA) matching ARGB_8888 target format
-    VipsImage *output = nullptr;
-    if (vips_image_get_bands(unpremultiplied) == 3) {
-        // If image channels got flattened to RGB (3 channels), attach solid Alpha channel (value 255)
-        VipsImage *alpha = nullptr;
-        double alpha_val = 255.0;
-        if (vips_black(&alpha, unpremultiplied->Xsize, unpremultiplied->Ysize, "bands", 1, nullptr) == 0 &&
-            vips_linear1(alpha, &alpha, 1.0, alpha_val, nullptr) == 0) {
-            vips_bandjoin2(unpremultiplied, alpha, &output, nullptr);
+    VipsImagePtr output;
+    
+    // Check and normalize format/bands
+    VipsImage *temp = unpremultiplied.get();
+    g_object_ref(temp);
+    VipsImagePtr temp_ptr(temp);
+
+    if (vips_image_get_interpretation(temp_ptr) != VIPS_INTERPRETATION_sRGB) {
+        VipsImage *coloured = nullptr;
+        if (vips_colourspace(temp_ptr, &coloured, VIPS_INTERPRETATION_sRGB, nullptr) == 0) {
+            temp_ptr.reset(coloured);
         }
-        if (alpha) g_object_unref(alpha);
-    } else {
-        output = unpremultiplied;
-        g_object_ref(output);
     }
 
-    if (!output) {
-        output = unpremultiplied;
-        g_object_ref(output);
+    int bands = vips_image_get_bands(temp_ptr);
+    VipsImage *rgba_raw = nullptr;
+
+    if (bands == 4) {
+        rgba_raw = temp_ptr.get();
+        g_object_ref(rgba_raw);
+    } else if (bands == 3) {
+        VipsImage *alpha = nullptr;
+        if (vips_black(&alpha, temp_ptr->Xsize, temp_ptr->Ysize, "bands", 1, nullptr) == 0) {
+            VipsImage *alpha_full = nullptr;
+            if (vips_linear1(alpha, &alpha_full, 1.0, 255.0, nullptr) == 0) {
+                vips_bandjoin2(temp_ptr, alpha_full, &rgba_raw, nullptr);
+            }
+            if (alpha_full) g_object_unref(alpha_full);
+        }
+        if (alpha) g_object_unref(alpha);
+    } else if (bands == 1) {
+        VipsImage *rgb = nullptr;
+        if (vips_colourspace(temp_ptr, &rgb, VIPS_INTERPRETATION_sRGB, nullptr) == 0) {
+            VipsImage *alpha = nullptr;
+            if (vips_black(&alpha, rgb->Xsize, rgb->Ysize, "bands", 1, nullptr) == 0) {
+                VipsImage *alpha_full = nullptr;
+                if (vips_linear1(alpha, &alpha_full, 1.0, 255.0, nullptr) == 0) {
+                    vips_bandjoin2(rgb, alpha_full, &rgba_raw, nullptr);
+                }
+                if (alpha_full) g_object_unref(alpha_full);
+            }
+            if (alpha) g_object_unref(alpha);
+            g_object_unref(rgb);
+        }
+    } else if (bands == 2) {
+        VipsImage *gray = nullptr;
+        VipsImage *alpha = nullptr;
+        if (vips_extract_band(temp_ptr, &gray, 0, "n", 1, nullptr) == 0 &&
+            vips_extract_band(temp_ptr, &alpha, 1, "n", 1, nullptr) == 0) {
+            VipsImage *rgb = nullptr;
+            if (vips_colourspace(gray, &rgb, VIPS_INTERPRETATION_sRGB, nullptr) == 0) {
+                vips_bandjoin2(rgb, alpha, &rgba_raw, nullptr);
+                g_object_unref(rgb);
+            }
+        }
+        if (gray) g_object_unref(gray);
+        if (alpha) g_object_unref(alpha);
+    }
+
+    if (!rgba_raw) {
+        rgba_raw = temp_ptr.get();
+        g_object_ref(rgba_raw);
+    }
+    output.reset(rgba_raw);
+
+    if (vips_image_get_format(output) != VIPS_BAND_FORMAT_UCHAR) {
+        VipsImage *cast_img = nullptr;
+        if (vips_cast(output, &cast_img, VIPS_BAND_FORMAT_UCHAR, nullptr) == 0) {
+            output.reset(cast_img);
+        }
     }
 
     // Render/Write output image pixels directly to a newly allocated memory buffer
@@ -500,13 +704,6 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
     if (!out_pixels) {
         LOGE("Vips: Failed to write output pixels memory buffer: %s", vips_error_buffer());
         vips_error_clear();
-        g_object_unref(output);
-        g_object_unref(unpremultiplied);
-        g_object_unref(resized);
-        g_object_unref(premultiplied);
-        g_object_unref(image);
-        AndroidBitmap_unlockPixels(env, srcBitmap);
-        AndroidBitmap_unlockPixels(env, dstBitmap);
         return JNI_FALSE;
     }
 
@@ -517,15 +714,6 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
 
     // Clean up allocated native resources
     g_free(out_pixels);
-    g_object_unref(output);
-    g_object_unref(unpremultiplied);
-    g_object_unref(resized);
-    g_object_unref(premultiplied);
-    g_object_unref(image);
-
-    // Unlock pixels
-    AndroidBitmap_unlockPixels(env, srcBitmap);
-    AndroidBitmap_unlockPixels(env, dstBitmap);
     return JNI_TRUE;
 }
 
