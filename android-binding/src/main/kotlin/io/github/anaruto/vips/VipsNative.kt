@@ -51,6 +51,26 @@ object VipsNative {
     external fun getVersion(): String
 
     /**
+     * Configures the maximum number of worker threads libvips will use.
+     */
+    external fun setConcurrency(concurrency: Int)
+
+    /**
+     * Configures the maximum number of operations kept in the cache.
+     */
+    external fun setCacheMax(maxOperations: Int)
+
+    /**
+     * Configures the maximum memory cache size in bytes.
+     */
+    external fun setCacheMaxMem(maxMemBytes: Long)
+
+    /**
+     * Configures the maximum number of open files cached.
+     */
+    external fun setCacheMaxFiles(maxFiles: Int)
+
+    /**
      * Retrieves image dimensions and format info from a file path.
      * Returns a JSON formatted metadata string.
      */

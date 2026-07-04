@@ -4,6 +4,7 @@
 #include <vips/vips.h>
 #include <string>
 #include <cstring>
+#include <thread>
 
 #define LOG_TAG "VIPS_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -12,7 +13,7 @@
 extern "C" {
 
 // ============================================================================
-// Core Library Lifecycle
+// Core Library Lifecycle & Optimizations
 // ============================================================================
 
 JNIEXPORT jboolean JNICALL
@@ -22,7 +23,16 @@ Java_io_github_anaruto_vips_VipsNative_init(JNIEnv *env, jclass clazz) {
         vips_error_clear();
         return JNI_FALSE;
     }
-    LOGI("libvips initialized successfully. Version: %s", vips_version_string());
+    
+    // Set optimized defaults for resource-constrained Android devices:
+    unsigned int cores = std::thread::hardware_concurrency();
+    vips_concurrency_set(cores > 0 ? cores : 2);
+    vips_cache_set_max_mem(50 * 1024 * 1024); // Limit cache memory to 50MB by default to prevent OOM
+    vips_cache_set_max(50);                   // Limit cache size to 50 operations
+    vips_cache_set_max_files(10);             // Limit max open files to 10
+    
+    LOGI("libvips initialized successfully (concurrency: %d, cache: 50MB). Version: %s", 
+         vips_concurrency_get(), vips_version_string());
     return JNI_TRUE;
 }
 
@@ -35,6 +45,30 @@ Java_io_github_anaruto_vips_VipsNative_shutdown(JNIEnv *env, jclass clazz) {
 JNIEXPORT jstring JNICALL
 Java_io_github_anaruto_vips_VipsNative_getVersion(JNIEnv *env, jclass clazz) {
     return env->NewStringUTF(vips_version_string());
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_anaruto_vips_VipsNative_setConcurrency(JNIEnv *env, jclass clazz, jint concurrency) {
+    vips_concurrency_set(concurrency);
+    LOGI("libvips concurrency configured to: %d threads", concurrency);
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_anaruto_vips_VipsNative_setCacheMax(JNIEnv *env, jclass clazz, jint maxOperations) {
+    vips_cache_set_max(maxOperations);
+    LOGI("libvips cache max operations configured to: %d", maxOperations);
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_anaruto_vips_VipsNative_setCacheMaxMem(JNIEnv *env, jclass clazz, jlong maxMemBytes) {
+    vips_cache_set_max_mem(maxMemBytes);
+    LOGI("libvips cache max memory configured to: %lld bytes", (long long)maxMemBytes);
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_anaruto_vips_VipsNative_setCacheMaxFiles(JNIEnv *env, jclass clazz, jint maxFiles) {
+    vips_cache_set_max_files(maxFiles);
+    LOGI("libvips cache max files configured to: %d", maxFiles);
 }
 
 // ============================================================================
@@ -401,12 +435,38 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
     double scale_y = (double)dstInfo.height / srcInfo.height;
     double vscale = scale_y / scale_x;
 
+    // PREMULTIPLY ALPHA: Multiply color channels by alpha channel prior to resizing.
+    // This resolves dark borders/halos on transparent areas during interpolation.
+    VipsImage *premultiplied = nullptr;
+    if (vips_premultiply(image, &premultiplied, nullptr) != 0) {
+        LOGE("Vips: Failed to premultiply alpha: %s", vips_error_buffer());
+        vips_error_clear();
+        g_object_unref(image);
+        AndroidBitmap_unlockPixels(env, srcBitmap);
+        AndroidBitmap_unlockPixels(env, dstBitmap);
+        return JNI_FALSE;
+    }
+
     // Resize using Lanczos-3 (default vips_resize kernel).
     // Specifying "vscale" allows asymmetric resizing (stretching) if target aspect ratio is different.
     VipsImage *resized = nullptr;
-    if (vips_resize(image, &resized, scale_x, "vscale", vscale, nullptr) != 0) {
+    if (vips_resize(premultiplied, &resized, scale_x, "vscale", vscale, nullptr) != 0) {
         LOGE("Vips: Failed to execute resize operation: %s", vips_error_buffer());
         vips_error_clear();
+        g_object_unref(premultiplied);
+        g_object_unref(image);
+        AndroidBitmap_unlockPixels(env, srcBitmap);
+        AndroidBitmap_unlockPixels(env, dstBitmap);
+        return JNI_FALSE;
+    }
+
+    // UNPREMULTIPLY ALPHA: Divide color channels by alpha channel back to standard RGBA.
+    VipsImage *unpremultiplied = nullptr;
+    if (vips_unpremultiply(resized, &unpremultiplied, nullptr) != 0) {
+        LOGE("Vips: Failed to unpremultiply alpha: %s", vips_error_buffer());
+        vips_error_clear();
+        g_object_unref(resized);
+        g_object_unref(premultiplied);
         g_object_unref(image);
         AndroidBitmap_unlockPixels(env, srcBitmap);
         AndroidBitmap_unlockPixels(env, dstBitmap);
@@ -415,23 +475,22 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
 
     // Ensure output has exactly 4 channels (RGBA) matching ARGB_8888 target format
     VipsImage *output = nullptr;
-    if (vips_image_get_bands(resized) == 3) {
+    if (vips_image_get_bands(unpremultiplied) == 3) {
         // If image channels got flattened to RGB (3 channels), attach solid Alpha channel (value 255)
         VipsImage *alpha = nullptr;
         double alpha_val = 255.0;
-        if (vips_black(&alpha, resized->Xsize, resized->Ysize, "bands", 1, nullptr) == 0 &&
+        if (vips_black(&alpha, unpremultiplied->Xsize, unpremultiplied->Ysize, "bands", 1, nullptr) == 0 &&
             vips_linear1(alpha, &alpha, 1.0, alpha_val, nullptr) == 0) {
-            vips_bandjoin2(resized, alpha, &output, nullptr);
+            vips_bandjoin2(unpremultiplied, alpha, &output, nullptr);
         }
         if (alpha) g_object_unref(alpha);
     } else {
-        output = resized;
+        output = unpremultiplied;
         g_object_ref(output);
     }
 
     if (!output) {
-        // Fallback
-        output = resized;
+        output = unpremultiplied;
         g_object_ref(output);
     }
 
@@ -442,7 +501,9 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
         LOGE("Vips: Failed to write output pixels memory buffer: %s", vips_error_buffer());
         vips_error_clear();
         g_object_unref(output);
+        g_object_unref(unpremultiplied);
         g_object_unref(resized);
+        g_object_unref(premultiplied);
         g_object_unref(image);
         AndroidBitmap_unlockPixels(env, srcBitmap);
         AndroidBitmap_unlockPixels(env, dstBitmap);
@@ -457,7 +518,9 @@ Java_io_github_anaruto_vips_VipsNative_resizeBitmap(JNIEnv *env, jclass clazz, j
     // Clean up allocated native resources
     g_free(out_pixels);
     g_object_unref(output);
+    g_object_unref(unpremultiplied);
     g_object_unref(resized);
+    g_object_unref(premultiplied);
     g_object_unref(image);
 
     // Unlock pixels

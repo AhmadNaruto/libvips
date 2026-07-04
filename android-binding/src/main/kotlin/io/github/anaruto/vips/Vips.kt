@@ -171,6 +171,44 @@ object Vips {
     }
 
     /**
+     * Sets the maximum number of worker threads libvips will use for parallel operations.
+     * By default, it is set to the number of available CPU cores.
+     */
+    fun setConcurrency(concurrency: Int) {
+        checkInitialized()
+        require(concurrency >= 1) { "Concurrency must be at least 1" }
+        VipsNative.setConcurrency(concurrency)
+    }
+
+    /**
+     * Sets the maximum number of operations that libvips can keep in its cache.
+     */
+    fun setCacheMax(maxOperations: Int) {
+        checkInitialized()
+        require(maxOperations >= 0) { "Cache max operations must be non-negative" }
+        VipsNative.setCacheMax(maxOperations)
+    }
+
+    /**
+     * Sets the maximum amount of memory (in bytes) that libvips can use for its cache.
+     * Setting this to 0 disables the cache memory limits.
+     */
+    fun setCacheMaxMem(maxMemBytes: Long) {
+        checkInitialized()
+        require(maxMemBytes >= 0L) { "Cache max memory must be non-negative" }
+        VipsNative.setCacheMaxMem(maxMemBytes)
+    }
+
+    /**
+     * Sets the maximum number of open files that libvips can cache.
+     */
+    fun setCacheMaxFiles(maxFiles: Int) {
+        checkInitialized()
+        require(maxFiles >= 0) { "Cache max files must be non-negative" }
+        VipsNative.setCacheMaxFiles(maxFiles)
+    }
+
+    /**
      * Shuts down the libvips cache and worker threads.
      */
     fun shutdown() {

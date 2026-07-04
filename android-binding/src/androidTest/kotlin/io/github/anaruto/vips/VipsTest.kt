@@ -127,4 +127,17 @@ class VipsTest {
         assertTrue("JSON should contain width", infoJson.contains("\"width\": 32"))
         assertTrue("JSON should contain height", infoJson.contains("\"height\": 32"))
     }
+
+    @Test
+    fun testCacheAndConcurrencyConfiguration() {
+        // Assert setting concurrency, cache memory, cache operations and cache files limits works without exceptions
+        try {
+            Vips.setConcurrency(4)
+            Vips.setCacheMax(10)
+            Vips.setCacheMaxMem(10 * 1024 * 1024L) // 10MB
+            Vips.setCacheMaxFiles(5)
+        } catch (e: Exception) {
+            fail("Setting configuration threw exception: ${e.message}")
+        }
+    }
 }

@@ -116,7 +116,21 @@ class MyApplication : Application() {
 }
 ```
 
-### B. Mengubah Ukuran Bitmap (Direct Resizing)
+#### B. Pengaturan Concurrency & Cache (Opsional)
+Untuk perangkat mobile yang memiliki keterbatasan memori, Anda dapat menyesuaikan batas memori cache dan jumlah thread worker agar aplikasi berjalan optimal tanpa risiko kehabisan memori (OOM).
+
+```kotlin
+// Membatasi memori cache libvips menjadi 30MB (default 50MB)
+Vips.setCacheMaxMem(30 * 1024 * 1024L)
+
+// Membatasi cache maksimal 30 operasi gambar
+Vips.setCacheMax(30)
+
+// Membatasi jumlah thread paralel (misalnya 4 thread)
+Vips.setConcurrency(4)
+```
+
+### C. Mengubah Ukuran Bitmap (Direct Resizing)
 
 #### 1. Resizing dengan Menentukan Bitmap Tujuan (Asymmetric Scaling / Stretch)
 Mengubah ukuran gambar secara efisien langsung di level native C++ menggunakan buffer pixel terikat.
